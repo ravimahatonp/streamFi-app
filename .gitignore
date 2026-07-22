@@ -1,8 +1,8 @@
 .next/
 node_modules/
-.env.local
 .env.*.local
 out/
 *.tsbuildinfo
 .DS_Store
 next-env.d.ts
+config.bat
