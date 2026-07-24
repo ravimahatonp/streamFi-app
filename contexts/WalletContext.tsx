@@ -35,6 +35,7 @@ import {
 import { getNetworkPassphrase } from '@/lib/env';
 import { queryClient } from '@/lib/queryClient';
 import { useTransactionStore } from '@/lib/store';
+import { useRouter } from 'next/navigation';
 
 // ── Concurrency Primitives ───────────────────────────────────────────────────
 
@@ -227,6 +228,7 @@ export function WalletProvider({
   const abortControllerRef = useRef<AbortController | null>(null);
   const semaphoreRef = useRef<Semaphore>(new Semaphore(maxConcurrentOperations));
   const connectMutexRef = useRef<Mutex>(new Mutex());
+  const router = useRouter();
 
   // Access the Zustand store's reset action outside of a component render
   const clearTransactions = useTransactionStore((s) => s.clearTransactions);
@@ -324,7 +326,8 @@ export function WalletProvider({
     // cannot see the previous wallet's streams (fixes #81).
     queryClient.clear();
     clearTransactions();
-  }, [clearTransactions]);
+    router.push('/');
+  }, [clearTransactions, router]);
 
   // ── signTx ─────────────────────────────────────────────────────────────────
 
