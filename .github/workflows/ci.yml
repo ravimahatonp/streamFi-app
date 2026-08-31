@@ -18,6 +18,17 @@ jobs:
           node-version: 20
           cache: npm
 
+      - name: Verify lockfile registry integrity
+        run: |
+          if grep -q "npmmirror" package-lock.json; then
+            echo "Error: package-lock.json contains registry.npmmirror.com URLs"
+            exit 1
+          fi
+          if grep -q "git+ssh" package-lock.json; then
+            echo "Error: package-lock.json contains unauthenticated git+ssh URLs"
+            exit 1
+          fi
+
       - run: npm ci
 
       - name: Lint

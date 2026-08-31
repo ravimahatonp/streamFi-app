@@ -146,6 +146,24 @@ describe('StreamPage (app/stream/[id]/page.tsx)', () => {
     expect(container.textContent).toContain('Stream not found.');
   });
 
+  it('surfaces the underlying error instead of "Stream not found" when the address lookup fails', async () => {
+    mockUseWallet.mockReturnValue({
+      publicKey: 'GWALLET',
+      connected: true,
+    } as unknown as ReturnType<typeof useWallet>);
+    mockAddr.mockRejectedValue(new Error('rpc down'));
+
+    await act(async () => {
+      root.render(React.createElement(StreamPage));
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain('rpc down');
+    expect(container.textContent).not.toContain('Stream not found');
+  });
+
   it('derives isSender/isRecipient correctly and renders StreamActions once loaded', async () => {
     mockUseWallet.mockReturnValue({
       publicKey: 'GSENDER',

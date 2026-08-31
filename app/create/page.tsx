@@ -3,7 +3,8 @@
 import { useState, useEffect, useRef } from 'react';
 import { useRouter }        from 'next/navigation';
 import { useForm }          from 'react-hook-form';
-import { z, ZodType } from 'zod';
+import { zodResolver }      from '@hookform/resolvers/zod';
+import { z } from 'zod';
 import { ArrowRight, Info } from 'lucide-react';
 import { useWallet }        from '@/contexts/WalletContext';
 import { createStream, isMock } from '@/lib/factory';
@@ -14,8 +15,9 @@ import { refreshStreamData } from '@/lib/queryClient';
 import { getFactoryContractId } from '@/lib/env';
 import { getTokenAllowanceGateway } from '@/lib/token-allowance-gateway';
 import styles from './CreateStream.module.css';
-import { toStroops, wouldRateTruncateToZero } from '@/lib/format';
-import { isValidStellarAddress } from '@/lib/stellar-address';
+import { toStroops, fromStroops, wouldRateTruncateToZero } from '@/lib/format';
+import { isValidStellarAddress, isValidStellarContract } from '@/lib/stellar-address';
+import { withTimeout } from '@/lib/with-timeout';
 
 
 const schema = z.object({
@@ -30,6 +32,21 @@ const schema = z.object({
   // 10 years mirrors DripGovernor's own default max_duration_seconds cap.
   durationSeconds: z.coerce.number().min(3600, 'Minimum 1 hour').max(315_360_000, 'Maximum 10 years'),
   clawback:        z.boolean(),
+  // #392 — only meaningful for a C… recipient; see the superRefine below.
+  acknowledgeContractRecipient: z.boolean(),
+}).superRefine((data, ctx) => {
+  // A contract can be set as a stream's recipient, but only an address that
+  // can *call* DripStream::withdraw as the recipient can ever pull the funds
+  // out. A SAC, a plain token contract, or a vault without that call path
+  // leaves the whole deposit stranded, and nothing on-chain can tell us in
+  // advance which kind we were handed — so the user has to say so.
+  if (isValidStellarContract(data.recipient) && !data.acknowledgeContractRecipient) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['acknowledgeContractRecipient'],
+      message: 'Confirm this contract can call withdraw() before creating the stream.',
+    });
+  }
 });
 
 /**
@@ -40,36 +57,14 @@ const schema = z.object({
 const CREATE_STREAM_TIMEOUT_MS = 60_000;
 
 /**
- * Race a promise against a timeout. Rejects with a descriptive error
- * if the operation does not complete within `ms` milliseconds.
+ * Timeout message for the create pipeline. It is rendered inline in the form,
+ * so it stays form-specific rather than using the shared helper's default
+ * `… timed out after 60000ms` (#393).
  */
-function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error(`${label} timed out after ${ms / 1000}s. The network may be congested — please try again.`));
-    }, ms);
-    promise.then(
-      (val) => { clearTimeout(timer); resolve(val); },
-      (err) => { clearTimeout(timer); reject(err); },
-    );
-  });
-}
-
-function zodResolver<T extends ZodType>(schema: T) {
-  return async (values: Record<string, unknown>) => {
-    const result = await schema.safeParseAsync(values);
-    if (result.success) {
-      return { values: result.data, errors: {} };
-    }
-    const errors: Record<string, { message?: string; type?: string }> = {};
-    for (const issue of result.error.issues) {
-      const path = issue.path.join('.');
-      if (!errors[path]) {
-        errors[path] = { message: issue.message, type: issue.code };
-      }
-    }
-    return { values: {}, errors };
-  };
+function createTimeoutError(ms: number, label?: string): Error {
+  return new Error(
+    `${label ?? 'The operation'} timed out after ${ms / 1000}s. The network may be congested — please try again.`,
+  );
 }
 
 type FormValues = z.infer<typeof schema>;
@@ -101,15 +96,30 @@ export default function CreatePage() {
   // isCurrent() pattern.
   const recipientSeqRef = useRef(0);
 
-  const { register, handleSubmit, watch, formState: { errors } } = useForm<FormValues>({
+  const { register, handleSubmit, watch, setValue, formState: { errors } } = useForm<FormValues>({
     resolver: zodResolver(schema),
-    defaultValues: { token: 'XLM', clawback: false, durationSeconds: 2592000 },
+    defaultValues: {
+      token: 'XLM',
+      clawback: false,
+      durationSeconds: 2592000,
+      acknowledgeContractRecipient: false,
+    },
   });
 
   const deposit  = watch('depositAmount');
   const duration = watch('durationSeconds');
   const token    = watch('token');
   const recipient = watch('recipient');
+  const acknowledgedContractRecipient = watch('acknowledgeContractRecipient');
+
+  // #392 — a C… recipient needs an explicit acknowledgement before submit.
+  const isContractRecipient = !!recipient && isValidStellarContract(recipient);
+
+  // The acknowledgement is about one specific contract, so editing the
+  // address always withdraws it.
+  useEffect(() => {
+    setValue('acknowledgeContractRecipient', false);
+  }, [recipient, setValue]);
 
   // Debounced async on-chain account existence check. Only fires once the
   // address satisfies the Zod schema (56 chars, starts with G) so we never
@@ -142,22 +152,26 @@ export default function CreatePage() {
     const controller = new AbortController();
 
     debounceRef.current = setTimeout(async () => {
-      // Hard timeout: if the RPC never responds, reject after 10s so the
-      // spinner is always cleared.
-      const timeoutId = setTimeout(() => controller.abort('timeout'), RECIPIENT_CHECK_TIMEOUT_MS);
-
       try {
-        // Add a 10-second timeout to prevent an infinite loading state (#123)
-        const exists = await checkRecipientExists(recipient, { timeoutMs: 10_000 });
+        // checkRecipientExists owns both the deadline (so the spinner is
+        // always cleared, #123) and the cancellation — the controller's
+        // signal is now actually passed through, where before it was created
+        // per effect run and never handed to anything.
+        const exists = await checkRecipientExists(recipient, {
+          timeoutMs: RECIPIENT_CHECK_TIMEOUT_MS,
+          signal:    controller.signal,
+        });
         if (!isCurrent()) return;
         setRecipientStatus(exists ? 'valid' : 'not-found');
       } catch (err) {
-        // Network / RPC error — don't block the user, but surface a warning.
-        if (!isCurrent()) return;
+        // Cancellation isn't a failure — the cleanup that aborted this check
+        // already reset the status for the address that replaced it.
+        if (controller.signal.aborted || !isCurrent()) return;
+        // Anything else means the check couldn't be made (#391): a hung or
+        // misconfigured RPC, a proxy error page. Warn, but never claim the
+        // recipient doesn't exist on this evidence.
         console.error('Recipient check failed:', err);
         setRecipientStatus('error');
-      } finally {
-        clearTimeout(timeoutId);
       }
     }, 600);
 
@@ -177,12 +191,27 @@ export default function CreatePage() {
   // token's own decimals rather than assume one for all of them.
   const tokenDecimals = TOKENS_TESTNET.find(t => t.symbol === token)?.decimals ?? 7;
 
-  const rate = deposit && duration
-    ? (parseFloat(deposit) * 10 ** tokenDecimals / duration).toFixed(2)
-    : '—';
+  // #364 — mirror onSubmit's exact bigint pipeline (toStroops then truncating
+  // BigInt division) instead of float math. parseFloat(deposit) * 10 **
+  // tokenDecimals loses precision for large deposits / high-decimal tokens,
+  // and float division rounds where the contract call truncates, so the
+  // preview could show a different rate than what actually gets submitted.
+  const previewRateStroops = deposit && duration
+    ? (() => {
+        try {
+          const depositStroops = toStroops(deposit, tokenDecimals);
+          if (depositStroops <= 0n || !Number.isFinite(duration) || duration <= 0) return null;
+          return depositStroops / BigInt(Math.floor(duration));
+        } catch {
+          return null;
+        }
+      })()
+    : null;
 
-  const ratePerDay = deposit && duration
-    ? (parseFloat(deposit) / (duration / 86400)).toFixed(4)
+  const rate = previewRateStroops !== null ? previewRateStroops.toString() : '—';
+
+  const ratePerDay = previewRateStroops !== null
+    ? fromStroops(previewRateStroops * 86400n, tokenDecimals)
     : null;
 
   // Live check, mirrors the exact bigint math onSubmit uses (see #243):
@@ -199,12 +228,23 @@ export default function CreatePage() {
       setError('Connect your wallet first.');
       return;
     }
-    // Reject if the on-chain check confirmed the account does not exist.
-    // (A status of 'idle' or 'checking' means the address is incomplete or
-    //  the check is still in-flight — Zod guards the shape; we only hard-block
-    //  on a definitive not-found result.)
+    // #363 — block on 'not-found' AND 'checking': the debounced RPC check
+    // can still be in flight when the user clicks Submit, and without this
+    // guard the not-found check below is bypassed entirely, letting a
+    // stream get created for a nonexistent recipient.
     if (recipientStatus === 'not-found') {
       setError('Recipient account does not exist on-chain. Please check the address.');
+      return;
+    }
+    if (recipientStatus === 'checking') {
+      setError('Still verifying the recipient address — please wait a moment and try again.');
+      return;
+    }
+    // #392 — belt and braces alongside the schema check, mirroring the
+    // recipientStatus guards above: never sign a deposit into a contract the
+    // user hasn't confirmed can withdraw from the stream.
+    if (isValidStellarContract(data.recipient) && !data.acknowledgeContractRecipient) {
+      setError('Confirm this contract can call withdraw() before creating the stream.');
       return;
     }
     setPending(true);
@@ -273,7 +313,7 @@ export default function CreatePage() {
         setAllowanceStage(null);
       }
 
-      const hash = await withTimeout(
+      const { hash, streamId } = await withTimeout(
         createStream({
           sender:     publicKey,
           recipient:  data.recipient,
@@ -285,7 +325,7 @@ export default function CreatePage() {
           clawback:   data.clawback,
         }, signTx),
         CREATE_STREAM_TIMEOUT_MS,
-        'Stream creation',
+        { label: 'Stream creation', onTimeout: createTimeoutError },
       );
 
       // Invalidate and refetch active stream data so the streams/dashboard
@@ -293,7 +333,13 @@ export default function CreatePage() {
       await refreshStreamData();
 
       setTxHash(hash);
-      setTimeout(() => router.push('/streams'), 3000);
+      // #362 — createStream now decodes the confirmed transaction's return
+      // value, so we can deep-link straight to the new stream instead of
+      // redirecting to /streams and hoping the user finds it. Fall back to
+      // /streams only if the RPC/node didn't report a return value.
+      setTimeout(() => {
+        router.push(streamId !== null ? `/stream/${streamId}` : '/streams');
+      }, 3000);
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Transaction failed');
     } finally {
@@ -354,19 +400,61 @@ export default function CreatePage() {
           {!errors.recipient && recipientStatus === 'not-found' && (
             <p className="text-xs text-red-600 mt-1" role="alert">
               <span aria-hidden="true">✗ </span>
-              Account not found on-chain — the recipient must be funded before receiving a stream.
+              {isContractRecipient
+                ? 'Contract not found on-chain — nothing is deployed at this address.'
+                : 'Account not found on-chain — the recipient must be funded before receiving a stream.'}
             </p>
           )}
           {!errors.recipient && recipientStatus === 'valid' && (
             <p className="text-xs text-gray-500 mt-1" role="status">
               <span aria-hidden="true">✓ </span>
-              Account verified on-chain.
+              {isContractRecipient
+                ? 'Contract found on-chain. Whether it can withdraw cannot be verified — see below.'
+                : 'Account verified on-chain.'}
             </p>
           )}
           {!errors.recipient && recipientStatus === 'error' && (
             <p className="text-xs text-gray-400 mt-1" role="status">
-              Could not verify account — network error. You may still proceed.
+              Could not check this address — the RPC endpoint may be unreachable or
+              misconfigured. This is not a statement about the recipient; you may still proceed.
             </p>
+          )}
+
+          {/* #392 — a contract recipient can only receive a stream it is able
+              to withdraw from. Nothing on-chain reveals that ahead of time, so
+              the risk is stated plainly and submit stays blocked until the
+              user acknowledges it. */}
+          {!errors.recipient && isContractRecipient && (
+            <div
+              className="mt-2 border border-red-200 rounded px-3 py-2"
+              role="alert"
+            >
+              <p className="text-xs font-semibold text-red-600">
+                Contract recipient — the deposit may be unrecoverable.
+              </p>
+              <p className="text-xs text-gray-600 dark:text-gray-400 mt-1">
+                Only an address that can call <span className="font-mono">withdraw()</span> on the
+                stream can ever pull these tokens out. A token or SAC contract, or a vault without
+                that call path, leaves the full deposit locked — and only the current recipient or
+                sender can re-point the stream afterwards.
+              </p>
+              <label className={`flex items-start gap-2 mt-2 cursor-pointer ${styles.flexRowStart}`}>
+                <input
+                  {...register('acknowledgeContractRecipient')}
+                  type="checkbox"
+                  className="mt-0.5 rounded border-gray-300"
+                />
+                <span className="text-xs text-gray-700 dark:text-gray-300">
+                  I control this contract and confirm it can call{' '}
+                  <span className="font-mono">withdraw()</span> on the stream.
+                </span>
+              </label>
+              {errors.acknowledgeContractRecipient && (
+                <p className="text-xs text-red-600 mt-1">
+                  {errors.acknowledgeContractRecipient.message}
+                </p>
+              )}
+            </div>
           )}
         </div>
 
@@ -471,7 +559,14 @@ export default function CreatePage() {
         {/* Submit */}
         <button
           type="submit"
-          disabled={pending || !connected || rateWouldBeZero || recipientStatus === 'not-found'}
+          disabled={
+            pending ||
+            !connected ||
+            rateWouldBeZero ||
+            recipientStatus === 'not-found' ||
+            recipientStatus === 'checking' ||
+            (isContractRecipient && !acknowledgedContractRecipient)
+          }
           className="btn-primary w-full"
         >
           {pending

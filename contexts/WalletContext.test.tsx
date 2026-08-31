@@ -518,6 +518,46 @@ describe('Mutex — queued acquire under load', () => {
     expect(typeof release3).toBe('function');
     release3();
   });
+
+  // #389 — the lock is handed to a waiter by `_release()` *before* the waiter
+  // checks its abort signal. Rejecting there without releasing strands the
+  // lock and deadlocks every later connect().
+  it('hands the lock on instead of stranding it when a waiter is aborted by the very release that dequeues it', async () => {
+    const mutex = new Mutex();
+    const release1 = await mutex.acquire();
+
+    // The holder releases from an abort listener registered before the
+    // waiter's own — exactly the shape disconnect() produces, where one
+    // signal both cancels queued work and frees the in-flight holder.
+    const controller = new AbortController();
+    controller.signal.addEventListener('abort', () => release1(), { once: true });
+
+    const queued = mutex.acquire(controller.signal);
+    controller.abort();
+    await expect(queued).rejects.toThrow(/aborted/i);
+
+    // The lock must be free again, not stuck in the aborted waiter's hands.
+    const release2 = await mutex.acquire();
+    expect(typeof release2).toBe('function');
+    release2();
+  });
+
+  it('rejects up front when acquire() is handed an already-aborted signal, instead of queueing a waiter that can never be woken', async () => {
+    const mutex = new Mutex();
+    const release1 = await mutex.acquire();
+
+    // An already-aborted signal never fires an 'abort' event, so the waiter
+    // would sit in the queue until `_release()` handed it the lock and it
+    // rejected — losing the lock for good (#389).
+    const controller = new AbortController();
+    controller.abort();
+    await expect(mutex.acquire(controller.signal)).rejects.toThrow(/aborted/i);
+
+    release1();
+    const release2 = await mutex.acquire();
+    expect(typeof release2).toBe('function');
+    release2();
+  });
 });
 
 describe('Semaphore — unit tests', () => {
@@ -639,6 +679,56 @@ describe('Semaphore — unit tests', () => {
     const release4 = await p4;
     expect(typeof release4).toBe('function');
     release4();
+  });
+
+  // #389 — `_release()` dequeues a waiter and hands it the permit without
+  // touching `_available`. If that waiter then rejects because its signal
+  // fired, the permit is gone for good.
+  it('returns the permit instead of losing it when a waiter is aborted by the very release that dequeues it', async () => {
+    const sem = new Semaphore(1);
+    const release1 = await sem.acquire();
+
+    const controller = new AbortController();
+    controller.signal.addEventListener('abort', () => release1(), { once: true });
+
+    const queued = sem.acquire(controller.signal);
+    expect(sem.pendingCount).toBe(1);
+
+    controller.abort();
+    await expect(queued).rejects.toThrow(/aborted/i);
+
+    expect(sem.availablePermits).toBe(1);
+    const release2 = await sem.acquire();
+    expect(typeof release2).toBe('function');
+    release2();
+  });
+
+  it('recovers every permit when a burst of queued waiters aborts as the holders release', async () => {
+    const sem = new Semaphore(3);
+    const holders = [await sem.acquire(), await sem.acquire(), await sem.acquire()];
+    expect(sem.availablePermits).toBe(0);
+
+    // One signal cancels all three queued waiters while simultaneously
+    // freeing the three holders — the disconnect()-mid-flight shape. Before
+    // the fix this exhausted the semaphore permanently and every subsequent
+    // signTx hung.
+    const controller = new AbortController();
+    for (const release of holders) {
+      controller.signal.addEventListener('abort', () => release(), { once: true });
+    }
+    const queued = [
+      sem.acquire(controller.signal),
+      sem.acquire(controller.signal),
+      sem.acquire(controller.signal),
+    ];
+
+    controller.abort();
+    for (const p of queued) {
+      await expect(p).rejects.toThrow(/aborted/i);
+    }
+
+    expect(sem.pendingCount).toBe(0);
+    expect(sem.availablePermits).toBe(3);
   });
 });
 

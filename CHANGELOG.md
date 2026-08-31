@@ -5,10 +5,18 @@ All notable changes are documented here. Format based on [Keep a Changelog](http
 ## [Unreleased]
 
 ### Added
+- Create form warns when the recipient is a contract (`C…`) address and blocks submit until the
+  user confirms the contract can call `withdraw()` — a SAC, token contract, or vault without that
+  call path would otherwise lock the whole deposit with no client-side warning
 - `/transactions` — responsive transaction history page (card layout on mobile, table on desktop)
 - Demo data layer — pages render without deployed contracts when env vars are empty
 
 ### Changed
+- One shared `withTimeout` in `lib/with-timeout.ts` replaces the three near-identical copies that
+  had drifted apart in `app/create/page.tsx`, `contexts/WalletContext.tsx` and `lib/soroban.ts`;
+  the shared helper is `AbortSignal`-aware, validates its deadline, and never leaves an abort
+  listener behind. Operation error types moved to `lib/errors.ts` (re-exported from
+  `lib/safe-operations.ts`, so existing imports are unchanged)
 - Stream cards responsive layout with truncated addresses and progress indicator
 - `/stream/[id]/history` — event log tab showing all past withdrawals, pauses, and top-ups
 - Mobile layout improvements for stream detail page
@@ -16,6 +24,14 @@ All notable changes are documented here. Format based on [Keep a Changelog](http
 
 ### Fixed
 - `withBoundedParallel` no longer manufactures and discards a fresh `AbortController` per item when the caller passes no outer signal — every handler in the batch now receives one shared, referenceable `AbortSignal` instead of a definitionally-dead one (#221)
+- `checkRecipientExists` now reads the recipient's ledger entry directly and treats only an empty
+  result as "does not exist"; an unrelated RPC failure (a JSON-RPC `Method not found`, a 404 from a
+  mistyped `NEXT_PUBLIC_SOROBAN_RPC_URL`, a proxy error page) is reported as "couldn't check"
+  instead of telling the user the recipient account doesn't exist. The create form's recipient
+  check also passes its abort signal through, which it previously created and never used
+- `Mutex`/`Semaphore` in `WalletContext` no longer lose the lock/permit when a queued waiter is
+  aborted in the same tick that dequeues it — after enough of those races the semaphore was
+  permanently exhausted and every `signTx` hung, and `connect()` deadlocked outright
 - `refreshStreamData` now invalidates active queries once instead of immediately refetching the same queries a second time
 - Removed the unused multisig transaction scaffold, which had no callers or tests and discarded the clipboard success result
 - `scValToU64`/`scValToI128` and `streamsBySender`/`streamsByRecipient` now boundary-check the RPC

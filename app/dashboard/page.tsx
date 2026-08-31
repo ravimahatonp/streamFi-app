@@ -31,12 +31,17 @@ function deriveStatus(info: StreamInfo, now: number): StreamStatus {
   return "active";
 }
 
+interface LoadRowsResult {
+  rows: StreamRow[];
+  failedCount: number;
+}
+
 async function loadRows(
   publicKey: string,
   role: "sender" | "recipient",
   now: number,
   signal: AbortSignal,
-): Promise<StreamRow[]> {
+): Promise<LoadRowsResult> {
   let ids: bigint[];
   try {
     ids =
@@ -44,41 +49,68 @@ async function loadRows(
         ? await streamsBySender(publicKey, publicKey, 0, 50, { signal })
         : await streamsByRecipient(publicKey, publicKey, 0, 50, { signal });
   } catch {
-    return [];
+    return { rows: [], failedCount: 0 };
   }
 
-  if (!ids || !Array.isArray(ids)) return [];
+  if (!ids || !Array.isArray(ids)) return { rows: [], failedCount: 0 };
 
-  const rows: StreamRow[] = [];
-  const seen = new Set<string>();
-  for (const id of ids) {
-    if (signal.aborted) return [];
-    if (typeof id !== "bigint") continue;
-    const rowId = id.toString();
-    if (seen.has(rowId)) continue;
-    try {
-      const addr = await getStreamAddress(publicKey, id, { signal });
-      if (!addr || typeof addr !== "string") continue;
-      const [info, withdrawable] = await Promise.all([
-        getStreamInfo(publicKey, addr, { signal }),
-        getWithdrawable(publicKey, addr, { signal }),
-      ]);
-      if (!info || typeof info !== "object") continue;
-      if (typeof info.ratePerSecond !== "bigint") continue;
-      if (signal.aborted) return [];
-      rows.push({
-        id: rowId,
-        address: addr,
-        info,
-        withdrawable,
-        status: deriveStatus(info, now),
-      });
-      seen.add(rowId);
-    } catch {
-      /* skip invalid streams */
+  const uniqueIds = [...new Set(ids.filter((id): id is bigint => typeof id === "bigint"))];
+
+  // Phase 1: resolve all stream addresses in parallel
+  const addrResults = await Promise.allSettled(
+    uniqueIds.map((id) => getStreamAddress(publicKey, id, { signal })),
+  );
+
+  const addrPairs: { id: bigint; rowId: string; addr: string }[] = [];
+  let failedCount = 0;
+  for (let i = 0; i < uniqueIds.length; i++) {
+    const r = addrResults[i];
+    if (signal.aborted) return { rows: [], failedCount: 0 };
+    if (r.status === "fulfilled" && r.value && typeof r.value === "string") {
+      addrPairs.push({ id: uniqueIds[i]!, rowId: uniqueIds[i]!.toString(), addr: r.value });
+    } else {
+      failedCount++;
     }
   }
-  return rows;
+
+  // Phase 2: fetch info+withdrawable in bounded-parallel batches
+  const BATCH_SIZE = 5;
+  const rows: StreamRow[] = [];
+
+  for (let start = 0; start < addrPairs.length; start += BATCH_SIZE) {
+    if (signal.aborted) return { rows: [], failedCount: 0 };
+    const batch = addrPairs.slice(start, start + BATCH_SIZE);
+    const results = await Promise.allSettled(
+      batch.map(({ addr }) =>
+        Promise.all([
+          getStreamInfo(publicKey, addr, { signal }),
+          getWithdrawable(publicKey, addr, { signal }),
+        ]),
+      ),
+    );
+    for (let j = 0; j < results.length; j++) {
+      const r = results[j];
+      const pair = batch[j]!;
+      if (
+        r.status === "fulfilled" &&
+        r.value[0] &&
+        typeof r.value[0] === "object" &&
+        typeof r.value[0].ratePerSecond === "bigint"
+      ) {
+        rows.push({
+          id: pair.rowId,
+          address: pair.addr,
+          info: r.value[0],
+          withdrawable: r.value[1],
+          status: deriveStatus(r.value[0], now),
+        });
+      } else {
+        failedCount++;
+      }
+    }
+  }
+
+  return { rows, failedCount };
 }
 
 // ── Page ──────────────────────────────────────────────────────────────────────
@@ -91,6 +123,7 @@ export default function DashboardPage() {
   const [sending, setSending] = useState<StreamRow[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [partialError, setPartialError] = useState<string | null>(null);
   // #307 — loadSeqRef is the ordering guard: each fetch captures its own
   // seq and only commits state if it's still the most recent request by the
   // time it resolves, the same pattern app/stream/[id]/page.tsx uses.
@@ -100,6 +133,7 @@ export default function DashboardPage() {
   // one, instead of each site spinning up its own untracked controller.
   const loadSeqRef = useRef(0);
   const activeControllerRef = useRef<AbortController | null>(null);
+  const lastFetchAtRef = useRef(0);
 
   const fetchStreams = useCallback(async (signal: AbortSignal) => {
     if (!publicKey) return;
@@ -108,14 +142,22 @@ export default function DashboardPage() {
     const now = Math.floor(Date.now() / 1000);
     setLoading(true);
     setError(null);
+    setPartialError(null);
     try {
       const [recv, sent] = await Promise.all([
         loadRows(publicKey, "recipient", now, signal),
         loadRows(publicKey, "sender", now, signal),
       ]);
       if (!signal.aborted && isCurrent()) {
-        setReceiving(recv);
-        setSending(sent);
+        setReceiving(recv.rows);
+        setSending(sent.rows);
+        const totalFailed = recv.failedCount + sent.failedCount;
+        if (totalFailed > 0) {
+          setPartialError(
+            `${totalFailed} stream${totalFailed === 1 ? "" : "s"} could not be loaded — some data may be missing.`,
+          );
+        }
+        lastFetchAtRef.current = Date.now();
       }
     } catch (e) {
       if (!signal.aborted && isCurrent()) {
@@ -139,12 +181,15 @@ export default function DashboardPage() {
       setReceiving([]);
       setSending([]);
       setError(null);
+      setPartialError(null);
       return;
     }
     refetch();
 
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
+        // Skip refetch if the last fetch was less than 5s ago
+        if (Date.now() - lastFetchAtRef.current < 5_000) return;
         refetch();
       }
     };
@@ -234,6 +279,19 @@ export default function DashboardPage() {
       {error && (
         <div className="card text-center py-4 mb-6 text-sm text-red-500 dark:text-red-400">
           {error}
+        </div>
+      )}
+
+      {partialError && !error && (
+        <div className="card text-center py-3 mb-6 text-sm text-amber-600 dark:text-amber-400 flex items-center justify-center gap-2">
+          <AlertCircle className="w-4 h-4 shrink-0" aria-hidden="true" />
+          {partialError}
+          <button
+            onClick={refetch}
+            className="underline font-semibold hover:text-black dark:hover:text-white ml-1"
+          >
+            Retry
+          </button>
         </div>
       )}
 

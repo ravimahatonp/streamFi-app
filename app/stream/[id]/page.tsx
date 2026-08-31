@@ -21,13 +21,19 @@ import type { StreamInfo } from '@/lib/stream';
 
 type StreamStatus = 'active' | 'paused' | 'ended' | 'cancelled';
 
-function deriveStatus(info: StreamInfo): StreamStatus {
+/** Derive the badge status from stream state and the *current* wall clock —
+ *  `nowSeconds` is passed in (not read here) so the page can re-derive it on a
+ *  tick and reflect the `active → ended` transition without a reload (#401). */
+function deriveStatus(info: StreamInfo, nowSeconds: number): StreamStatus {
   if (info.cancelled) return 'cancelled';
   if (info.paused)    return 'paused';
-  const now = Math.floor(Date.now() / 1000);
-  if (info.endTime > 0 && now >= info.endTime) return 'ended';
+  if (info.endTime > 0 && nowSeconds >= info.endTime) return 'ended';
   return 'active';
 }
+
+/** How often to re-fetch stream state so a pause/cancel done from another
+ *  device/tab shows up without a manual reload. */
+const STREAM_REFRESH_MS = 20_000;
 
 // ── Page ─────────────────────────────────────────────────────────────────────
 
@@ -40,7 +46,7 @@ export default function StreamPage() {
   const [streamAddress, setStreamAddress]         = useState<string | null>(null);
   const [info,          setInfo]                  = useState<StreamInfo | null>(null);
   const [withdrawable,  setWithdrawable]          = useState<bigint>(0n);
-  const [status,        setStatus]                = useState<StreamStatus>('active');
+  const [nowSeconds,    setNowSeconds]            = useState(() => Math.floor(Date.now() / 1000));
   const [loading,       setLoading]               = useState(true);
   const [error,         setError]                 = useState<string | null>(null);
 
@@ -48,12 +54,18 @@ export default function StreamPage() {
     return () => { mounted.current = false; };
   }, []);
 
+  // Tick the clock every second so a time-based `active → ended` transition
+  // (and RateTicker) update while the tab stays open (#401).
+  useEffect(() => {
+    const t = setInterval(() => setNowSeconds(Math.floor(Date.now() / 1000)), 1_000);
+    return () => clearInterval(t);
+  }, []);
+
   const loadStream = useCallback(async () => {
     if (!publicKey) {
       setStreamAddress(null);
       setInfo(null);
       setWithdrawable(0n);
-      setStatus('active');
       setLoading(false);
       setError(null);
       return;
@@ -65,20 +77,27 @@ export default function StreamPage() {
     setLoading(true);
     setError(null);
     try {
+      if (!/^\d+$/.test(id)) {
+        if (isCurrent()) setError('Invalid stream ID.');
+        return;
+      }
+
       const addr = await getStreamAddress(publicKey, BigInt(id));
       if (!isCurrent()) return;
       if (!addr) { setError('Stream not found.'); return; }
 
-      const [streamInfo, wAmt] = await Promise.all([
-        getStreamInfo(publicKey, addr),
-        getWithdrawable(publicKey, addr),
-      ]);
-
+      const streamInfo = await getStreamInfo(publicKey, addr);
       if (!isCurrent()) return;
+
       setStreamAddress(addr);
       setInfo(streamInfo);
-      setWithdrawable(wAmt);
-      setStatus(deriveStatus(streamInfo));
+
+      try {
+        const wAmt = await getWithdrawable(publicKey, addr);
+        if (isCurrent()) setWithdrawable(wAmt);
+      } catch {
+        if (isCurrent()) setWithdrawable(0n);
+      }
     } catch (e) {
       if (!isCurrent()) return;
       setError(e instanceof Error ? e.message : 'Failed to load stream.');
@@ -88,6 +107,32 @@ export default function StreamPage() {
   }, [id, publicKey]);
 
   useEffect(() => { loadStream(); }, [loadStream]);
+
+  // Background refresh so a pause/cancel from another device/tab is reflected
+  // without a manual reload. Silent — never touches `loading`, and a transient
+  // RPC error just keeps the last-good data (the 1s tick still handles the
+  // time-based `ended` transition) (#401).
+  useEffect(() => {
+    if (!publicKey || !streamAddress) return;
+    const addr = streamAddress;
+    const t = setInterval(async () => {
+      try {
+        const streamInfo = await getStreamInfo(publicKey, addr);
+        if (mounted.current) setInfo(streamInfo);
+      } catch {
+        /* keep last-good data */
+      }
+      try {
+        const wAmt = await getWithdrawable(publicKey, addr);
+        if (mounted.current) setWithdrawable(wAmt);
+      } catch {
+        /* keep last-good withdrawable */
+      }
+    }, STREAM_REFRESH_MS);
+    return () => clearInterval(t);
+  }, [publicKey, streamAddress]);
+
+  const status: StreamStatus = info ? deriveStatus(info, nowSeconds) : 'active';
 
   // ── Render states ─────────────────────────────────────────────────────────
 
@@ -122,7 +167,16 @@ export default function StreamPage() {
 
   const isSender    = !!publicKey && publicKey === info.sender;
   const isRecipient = !!publicKey && publicKey === info.recipient;
-  const totalDeposited = info.withdrawn + withdrawable;
+  // #361 — withdrawn + withdrawable is the amount streamed so far (already
+  // claimed plus currently claimable), not what the sender deposited: it
+  // excludes principal still escrowed in the DripStream contract that
+  // hasn't streamed yet. For fixed-duration streams the deposit is
+  // rate_per_second * duration; open-ended streams (endTime === 0) have no
+  // fixed deposit to derive this way, so fall back to the streamed-so-far
+  // total as the best available estimate.
+  const totalDeposited = info.endTime > 0
+    ? info.ratePerSecond * BigInt(info.endTime - info.startTime)
+    : info.withdrawn + withdrawable;
   // #318 — info.token is the SEP-41 contract address, not a display symbol;
   // truncateAddress(info.token) rendered e.g. "Withdraw 42.50 CDLZ…CYSC"
   // instead of "Withdraw 42.50 XLM". Resolve to a symbol where known,
@@ -154,6 +208,7 @@ export default function StreamPage() {
             <RateTicker
               ratePerSecond={info.ratePerSecond}
               startBalance={withdrawable}
+              endTime={info.endTime}
             />
           </p>
           <p className="text-xs text-gray-400 dark:text-gray-500 mt-1">{tokenSymbol}</p>

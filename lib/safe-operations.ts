@@ -8,37 +8,24 @@
 
 // ── Custom Error Types ───────────────────────────────────────────────────────
 
-export class OperationAbortedError extends Error {
-  readonly code = 'OPERATION_ABORTED';
-  constructor(message = 'Operation aborted') {
-    super(message);
-    this.name = 'OperationAbortedError';
-  }
-}
+// The error classes live in ./errors so that lib/with-timeout.ts can throw
+// them without importing this module (which pulls in the Stellar SDK) — see
+// #393. They are re-exported here so every existing
+// `from '@/lib/safe-operations'` import keeps working unchanged.
+import {
+  OperationAbortedError,
+  OperationTimeoutError,
+  ConcurrencyLimitError,
+  IdempotencyConflictError,
+} from './errors';
+import { withTimeout } from './with-timeout';
 
-export class OperationTimeoutError extends Error {
-  readonly code = 'OPERATION_TIMEOUT';
-  constructor(message = 'Operation timed out') {
-    super(message);
-    this.name = 'OperationTimeoutError';
-  }
-}
-
-export class ConcurrencyLimitError extends Error {
-  readonly code = 'CONCURRENCY_LIMIT';
-  constructor(message = 'Too many concurrent operations') {
-    super(message);
-    this.name = 'ConcurrencyLimitError';
-  }
-}
-
-export class IdempotencyConflictError extends Error {
-  readonly code = 'IDEMPOTENCY_CONFLICT';
-  constructor(message = 'Operation with the same idempotency key is already in-flight') {
-    super(message);
-    this.name = 'IdempotencyConflictError';
-  }
-}
+export {
+  OperationAbortedError,
+  OperationTimeoutError,
+  ConcurrencyLimitError,
+  IdempotencyConflictError,
+};
 
 // ── Normalized Operation Result ──────────────────────────────────────────────
 
@@ -157,14 +144,15 @@ export async function withBoundedParallel<T>(
   const results: SafeOperationResult<any>[] = [];
   let index = 0;
 
-  // When the caller passes no outer signal, fall back to a single signal
-  // created once for the whole batch — not one per item. A fresh
-  // `new AbortController().signal` built inline per iteration is discarded
-  // the instant it's created: nothing holds the controller, so `.abort()`
-  // can never fire and every handler's signal reads `aborted: false`
-  // forever, silently defeating per-item cancellation (#221). One shared
-  // controller at least makes the signal a coherent, referenceable object
-  // — the same instance every item receives.
+  // When the caller doesn't pass an outer signal, fall back to a single
+  // AbortController created once for the whole batch — not one per item.
+  // A fresh AbortController allocated per item is discarded the instant
+  // it's created; nothing ever holds a reference to it, so `.abort()` can
+  // never be called and every handler's signal reads `aborted: false`
+  // forever, silently defeating per-item cancellation (#221). Sharing one
+  // controller across the batch at least makes the signal a coherent,
+  // referenceable object — the same one every item receives — instead of
+  // a dead one manufactured and thrown away per item.
   const fallbackSignal = options?.signal ?? new AbortController().signal;
 
   const worker = async () => {
@@ -203,26 +191,9 @@ export async function withBoundedParallel<T>(
 
 // ── Timeout Helper ───────────────────────────────────────────────────────────
 
-async function withTimeout<T>(
-  promise: Promise<T>,
-  ms: number,
-  context?: string,
-): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      reject(new OperationTimeoutError(
-        context ? `${context} timed out after ${ms}ms` : `Operation timed out after ${ms}ms`,
-      ));
-    }, ms);
-  });
-
-  try {
-    return await Promise.race([promise, timeout]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
+// The local copy of `withTimeout` was one of four near-identical
+// implementations across the app; it now comes from lib/with-timeout.ts,
+// which produces the same OperationTimeoutError message (#393).
 
 // ── Precision Helpers ────────────────────────────────────────────────────────
 

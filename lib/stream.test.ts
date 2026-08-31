@@ -65,10 +65,10 @@ describe('getStreamAddress', () => {
     expect(await getStreamAddress(SENDER, 999n)).toBeNull();
   });
 
-  it('returns null (not throw) when the underlying call rejects', async () => {
+  it('lets failures propagate so callers can tell "not found" from "RPC down"', async () => {
     mockSimulateReadOnly.mockRejectedValue(new Error('rpc down'));
     const { getStreamAddress } = await import('./stream.js');
-    expect(await getStreamAddress(SENDER, 1n)).toBeNull();
+    await expect(getStreamAddress(SENDER, 1n)).rejects.toThrow('rpc down');
   });
 });
 
@@ -116,7 +116,9 @@ describe('getStreamInfo', () => {
   it('throws a clear error when a field is missing rather than silently defaulting', async () => {
     mockSimulateReadOnly.mockResolvedValue(scvMap({
       sender: new Address(SENDER).toScVal(),
-      // recipient deliberately omitted
+      // recipient deliberately omitted — flags included so the missing-recipient
+      // path is exercised first (flags is now read before sender/recipient).
+      flags: xdr.ScVal.scvU32(0),
     }));
     const { getStreamInfo } = await import('./stream.js');
     await expect(getStreamInfo(SENDER, STREAM_ADDRESS)).rejects.toThrow(/Missing field: recipient/);
@@ -195,7 +197,7 @@ describe('getStreamInfo', () => {
 
 describe('mutating calls', () => {
   it('withdraw() invokes withdraw with the i128 amount', async () => {
-    mockInvokeContract.mockResolvedValue('hash1');
+    mockInvokeContract.mockResolvedValue({ hash: 'hash1' });
     const { withdraw } = await import('./stream.js');
     const signTx = vi.fn();
     const hash = await withdraw(SENDER, STREAM_ADDRESS, 5_000n, signTx);
@@ -206,7 +208,7 @@ describe('mutating calls', () => {
   });
 
   it('cancel() invokes cancel with no args', async () => {
-    mockInvokeContract.mockResolvedValue('hash2');
+    mockInvokeContract.mockResolvedValue({ hash: 'hash2' });
     const { cancel } = await import('./stream.js');
     const signTx = vi.fn();
     expect(await cancel(SENDER, STREAM_ADDRESS, signTx)).toBe('hash2');
@@ -214,7 +216,7 @@ describe('mutating calls', () => {
   });
 
   it('pause()/resume() invoke their respective methods', async () => {
-    mockInvokeContract.mockResolvedValue('hash3');
+    mockInvokeContract.mockResolvedValue({ hash: 'hash3' });
     const { pause, resume } = await import('./stream.js');
     const signTx = vi.fn();
     await pause(SENDER, STREAM_ADDRESS, signTx);
@@ -224,7 +226,7 @@ describe('mutating calls', () => {
   });
 
   it('topUp() invokes top_up with the i128 amount', async () => {
-    mockInvokeContract.mockResolvedValue('hash4');
+    mockInvokeContract.mockResolvedValue({ hash: 'hash4' });
     const { topUp } = await import('./stream.js');
     const signTx = vi.fn();
     await topUp(SENDER, STREAM_ADDRESS, 25_000n, signTx);
@@ -234,7 +236,7 @@ describe('mutating calls', () => {
   });
 
   it('clawback() invokes clawback with no args', async () => {
-    mockInvokeContract.mockResolvedValue('hash5');
+    mockInvokeContract.mockResolvedValue({ hash: 'hash5' });
     const { clawback } = await import('./stream.js');
     const signTx = vi.fn();
     expect(await clawback(SENDER, STREAM_ADDRESS, signTx)).toBe('hash5');
