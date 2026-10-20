@@ -12,7 +12,8 @@ import { TOKENS_TESTNET, tokenLogoUrl } from '@/lib/tokens';
 import { CopyHashButton }   from '@/components/ui/CopyHashButton';
 import { checkRecipientExists } from '@/lib/soroban';
 import { checkContractHasWithdraw } from '@/lib/contract-recipient-probe';
-import { refreshStreamData } from '@/lib/queryClient';
+import { queryClient, refreshStreamData } from '@/lib/queryClient';
+import { invalidateTokenBalance } from '@/hooks/useTokenBalance';
 import { getFactoryContractId } from '@/lib/env';
 import { getTokenAllowanceGateway } from '@/lib/token-allowance-gateway';
 import { useDebounce } from '@/hooks/useDebounce';
@@ -86,6 +87,7 @@ const DURATION_PRESETS = [
 ] as const;
 
 const CREATE_STREAM_TIMEOUT_MS = 60_000;
+const DRAFT_KEY = 'conduit:create-stream-draft';
 
 /**
  * Timeout message for the create pipeline. It is rendered inline in the form,
@@ -134,6 +136,25 @@ export default function CreatePage() {
     },
   });
 
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem(DRAFT_KEY);
+      if (saved) {
+        const draft = JSON.parse(saved) as Partial<FormValues>;
+        for (const key of ['recipient', 'token', 'depositAmount', 'durationSeconds', 'clawback'] as const) {
+          if (draft[key] !== undefined) setValue(key, draft[key] as never);
+        }
+      }
+    } catch { /* stale or unavailable storage is non-fatal */ }
+  }, [setValue]);
+
+  useEffect(() => {
+    const subscription = watch((values) => {
+      try { localStorage.setItem(DRAFT_KEY, JSON.stringify(values)); } catch { /* storage is optional */ }
+    });
+    return () => subscription.unsubscribe();
+  }, [watch]);
+
   const deposit  = watch('depositAmount');
   const duration = watch('durationSeconds');
   const token    = watch('token');
@@ -155,7 +176,7 @@ export default function CreatePage() {
   }, [recipient, setValue]);
 
   // Debounce the recipient input with a 600ms delay to reduce RPC calls
-  const debouncedRecipient = useDebounce(recipient, 600);
+  const [debouncedRecipient, { flush: flushRecipient }] = useDebounce(recipient, 600);
 
   // Async on-chain account existence check. Only fires once the
   // address satisfies the Zod schema (56 chars, starts with G) so we never
@@ -270,6 +291,14 @@ export default function CreatePage() {
     // can still be in flight when the user clicks Submit, and without this
     // guard the not-found check below is bypassed entirely, letting a
     // stream get created for a nonexistent recipient.
+    // #672 — a debounce still pending at submit means recipientStatus
+    // describes an older address. Flush it so the check starts now, and
+    // make the user retry once it has verified the address actually entered.
+    if (debouncedRecipient !== data.recipient) {
+      flushRecipient();
+      setError('Still verifying the recipient address — please wait a moment and try again.');
+      return;
+    }
     if (recipientStatus === 'not-found') {
       setError('Recipient account does not exist on-chain. Please check the address.');
       return;
@@ -379,8 +408,11 @@ export default function CreatePage() {
       // Invalidate and refetch active stream data so the streams/dashboard
       // pages reflect the newly created stream immediately (fixes #162).
       await refreshStreamData();
+      // #756 — the deposit left the wallet; refresh the displayed token balance.
+      await invalidateTokenBalance(queryClient, publicKey, tokenAddr);
 
       setTxHash(hash);
+      try { localStorage.removeItem(DRAFT_KEY); } catch { /* storage is optional */ }
       // #362 — createStream now decodes the confirmed transaction's return
       // value, so we can deep-link straight to the new stream instead of
       // redirecting to /streams and hoping the user finds it. Fall back to

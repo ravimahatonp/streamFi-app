@@ -19,18 +19,17 @@ export function useStreamNote(streamAddress: string): UseStreamNoteReturn {
 
   // Load note from storage on mount
   useEffect(() => {
-    const stored = getStreamNote(streamAddress);
-    setNote(stored);
+    void getStreamNote(streamAddress).then(setNote);
   }, [streamAddress]);
 
   const updateNote = (newNote: string) => {
-    saveStreamNote(streamAddress, newNote);
+    void saveStreamNote(streamAddress, newNote);
     setNote(newNote.trim() || null);
     setIsEditing(false);
   };
 
   const clearNote = () => {
-    saveStreamNote(streamAddress, '');
+    void saveStreamNote(streamAddress, '');
     setNote(null);
     setIsEditing(false);
   };
@@ -44,3 +43,4 @@ export function useStreamNote(streamAddress: string): UseStreamNoteReturn {
     clearNote,
   };
 }
+

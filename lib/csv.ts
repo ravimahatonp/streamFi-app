@@ -61,6 +61,12 @@ function formatTimestamp(value: any, format?: DateFormat): CsvValue {
   }
 }
 
+export interface CsvColumn<T> {
+  key: string;
+  header: string;
+  value: (row: T) => CsvValue;
+}
+
 function encodeField(value: CsvValue): string {
   let s = value == null ? '' : String(value);
 
@@ -81,6 +87,14 @@ export function toCsv(headers: readonly CsvValue[], rows: readonly CsvValue[][])
   return [headers, ...rows]
     .map((row) => row.map(encodeField).join(','))
     .join('\r\n');
+}
+
+/** Export typed history rows using only the caller-selected columns. */
+export function toCsvColumns<T>(rows: readonly T[], columns: readonly CsvColumn<T>[]): string {
+  return toCsv(
+    columns.map((column) => column.header),
+    rows.map((row) => columns.map((column) => column.value(row))),
+  );
 }
 
 /**
@@ -134,3 +148,4 @@ export function downloadCsv(filename: string, csv: string): void {
   anchor.remove();
   URL.revokeObjectURL(url);
 }
+

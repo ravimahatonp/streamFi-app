@@ -87,7 +87,10 @@ export function CommandPalette() {
 
   // Auto-scroll the active option into view for keyboard navigation (#651).
   useEffect(() => {
-    itemRefs.current[activeIndex]?.scrollIntoView({ block: "nearest" });
+    const activeItem = itemRefs.current[activeIndex];
+    if (activeItem && typeof activeItem.scrollIntoView === "function") {
+      activeItem.scrollIntoView({ block: "nearest" });
+    }
   }, [activeIndex, open, query]);
 
   // Global Escape dismissal so the palette closes even when focus is not

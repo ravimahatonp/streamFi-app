@@ -12,14 +12,19 @@ export function Tooltip({ content, children, side = 'top' }: TooltipProps) {
   const [show, setShow] = useState(false);
   const tooltipId = useId();
 
+  const handleShow = () => setShow(true);
+  const handleHide = () => setShow(false);
+
   return (
     <span
       className="relative inline-flex"
-      onMouseEnter={() => setShow(true)}
-      onMouseLeave={() => setShow(false)}
-      onFocus={() => setShow(true)}
-      onBlur={() => setShow(false)}
-      aria-describedby={show ? tooltipId : undefined}
+      onMouseEnter={handleShow}
+      onMouseLeave={handleHide}
+      onFocus={handleShow}
+      onBlur={handleHide}
+      onTouchStart={handleShow}
+      onTouchEnd={handleHide}
+      onTouchCancel={handleHide}
     >
       {children}
       {show && (

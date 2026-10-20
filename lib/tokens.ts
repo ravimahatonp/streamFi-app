@@ -14,6 +14,22 @@ export interface TokenMeta {
   logoUrl?: string;
 }
 
+export interface StellarExpertVerification { verified: boolean; token?: TokenMeta; error?: string; }
+
+/** Verify an asset against Stellar Expert's public token directory. */
+export async function verifyTokenAgainstStellarExpert(code: string, issuer: string, network: 'mainnet' | 'testnet' = 'mainnet', options: { signal?: AbortSignal } = {}): Promise<StellarExpertVerification> {
+  if (!code || !issuer) return { verified: false, error: 'Token code and issuer are required' };
+  const url = `https://api.stellar.expert/explorer/${network}/asset/${encodeURIComponent(code)}-${encodeURIComponent(issuer)}`;
+  try {
+    const response = await fetch(url, { signal: options.signal, headers: { Accept: 'application/json' } });
+    if (!response.ok) return { verified: false, error: `Stellar Expert returned ${response.status}` };
+    const data = await response.json() as { asset?: { code?: string; issuer?: string; name?: string; decimals?: number; image?: string } };
+    const asset = data.asset;
+    if (!asset?.code || asset.issuer !== issuer) return { verified: false, error: 'Asset was not found in Stellar Expert' };
+    return { verified: true, token: { symbol: asset.code, name: asset.name ?? asset.code, decimals: asset.decimals ?? 7, address: issuer, logoUrl: asset.image } };
+  } catch (error) { return { verified: false, error: error instanceof Error ? error.message : 'Token verification failed' }; }
+}
+
 export const TOKENS_TESTNET: TokenMeta[] = [
   {
     symbol: 'XLM',
@@ -287,4 +303,91 @@ export async function approveAllowance(
     success: true,
     txHash: res.data,
   };
+}
+
+/**
+ * Popular Stellar testnet faucet tokens for developer/QA onboarding (issue #805).
+ * These tokens are available on testnet with one-click faucet funding.
+ */
+export const TESTNET_FAUCET_TOKENS: TokenMeta[] = [
+  {
+    symbol: 'XLM',
+    name: 'Stellar Lumens',
+    decimals: 7,
+    address: 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC',
+    logoUrl: '/tokens/xlm.svg',
+  },
+  {
+    symbol: 'USDC',
+    name: 'USD Coin',
+    decimals: 7,
+    address: 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA',
+    logoUrl: '/tokens/usdc.svg',
+  },
+  {
+    symbol: 'EURC',
+    name: 'Euro Coin',
+    decimals: 7,
+    address: 'CCUUDM434BMZMYWYDITHFXHDMIVTGGD6T2I5UKNX5BSLXLW7HVR4MCGZ',
+    logoUrl: '/tokens/eurc.svg',
+  },
+  {
+    symbol: 'gm',
+    name: 'Good Morning Token',
+    decimals: 7,
+    address: 'CAHGM72TQCVX2TXHQMXRPVB2QTMOBVBHFQGSQMDNXC5JDVX4DVZUTSR',
+    logoUrl: '/tokens/gm.svg',
+  },
+  {
+    symbol: 'test',
+    name: 'Test Token',
+    decimals: 7,
+    address: 'CAZCSCBYTOBTNJF6GRUW22N5KJ25RKTKGBXD3CI4BDZQUGDK4F7C7R6X',
+    logoUrl: '/tokens/test.svg',
+  },
+];
+
+/**
+ * Helper to claim testnet faucet tokens for a given account.
+ * Initiates a one-click mint request to populate the account with test tokens.
+ */
+export async function claimTestnetFaucetTokens(
+  address: string,
+  tokenAddress?: string,
+  options: { signal?: AbortSignal } = {}
+): Promise<string> {
+  if (!address || !address.startsWith('G')) {
+    throw new Error('Invalid Stellar address: must be a valid public key (G-address)');
+  }
+
+  const params = new URLSearchParams({ account: address });
+  if (tokenAddress) params.append('asset', tokenAddress);
+
+  const faucetUrl = new URL('https://friendbot.stellar.org/');
+  faucetUrl.search = params.toString();
+
+  try {
+    const response = await fetch(faucetUrl, {
+      method: 'GET',
+      signal: options.signal,
+      headers: { Accept: 'application/json' },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Faucet returned ${response.status}`);
+    }
+
+    const data = await response.json() as { hash?: string };
+    if (!data.hash) {
+      throw new Error('Faucet did not return a transaction hash');
+    }
+
+    return data.hash;
+  } catch (error) {
+    throw new Error(
+      error instanceof Error
+        ? `Faucet claim failed: ${error.message}`
+        : 'Testnet faucet request failed'
+    );
+  }
 }

@@ -1,4 +1,6 @@
 import { useSyncExternalStore } from 'react';
+import { useEffect, useRef } from 'react';
+import toast from 'react-hot-toast';
 import {
   getNetworkEpisode,
   getNetworkStatus,
@@ -19,6 +21,17 @@ export interface NetworkStatusSnapshot {
  * `'ok'` so markup stays stable through hydration.
  */
 export function useNetworkStatus(): NetworkStatusSnapshot {
+  const wasOffline = useRef(false);
+  useEffect(() => {
+    const onOffline = () => { wasOffline.current = true; };
+    const onOnline = () => {
+      if (wasOffline.current) toast.success('Connection restored');
+      wasOffline.current = false;
+    };
+    window.addEventListener('offline', onOffline);
+    window.addEventListener('online', onOnline);
+    return () => { window.removeEventListener('offline', onOffline); window.removeEventListener('online', onOnline); };
+  }, []);
   const status = useSyncExternalStore(
     subscribeNetworkStatus,
     getNetworkStatus,
@@ -31,3 +44,4 @@ export function useNetworkStatus(): NetworkStatusSnapshot {
   );
   return { status, episode };
 }
+

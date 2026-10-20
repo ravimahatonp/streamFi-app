@@ -142,6 +142,24 @@ export function isCircuitOpen(scope?: string): boolean {
   return false;
 }
 
+/**
+ * Test connectivity for a circuit breaker scope and update breaker state.
+ * Resets breaker on success or records failure.
+ */
+export async function testCircuit(scope?: string): Promise<boolean> {
+  try {
+    const server = getServer();
+    await server.getFeeStats();
+    resetCircuitBreaker(scope);
+    return true;
+  } catch (err) {
+    if (isTransportFailure(err)) {
+      recordFailure(scope);
+    }
+    return false;
+  }
+}
+
 function recordFailure(scope?: string): void {
   const key = getCircuitKey(scope);
   const state = getCircuitState(key);
@@ -323,6 +341,12 @@ function validateCall(
 // ── Fee pricing ───────────────────────────────────────────────────────────────
 
 let feeStatsCache: { fee: number; at: number } | undefined;
+
+/** Latest closed ledger sequence from the RPC node. */
+export async function getLatestLedgerSequence(): Promise<number> {
+  const { sequence } = await getServer().getLatestLedger();
+  return sequence;
+}
 
 /**
  * Price the inclusion (bid) fee for a contract transaction.

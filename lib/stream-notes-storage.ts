@@ -13,6 +13,29 @@ export interface StreamNotesStore {
 }
 
 const memoryStore = new Map<string, string>();
+const NOTE_KEY = 'conduit:stream-notes-key';
+
+async function getKey(): Promise<CryptoKey> {
+  const seed = process.env.NEXT_PUBLIC_STREAM_NOTE_KEY || 'conduit-local-notes';
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(seed));
+  return crypto.subtle.importKey('raw', digest, 'AES-GCM', false, ['encrypt', 'decrypt']);
+}
+
+async function encrypt(value: string): Promise<string> {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const data = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, await getKey(), new TextEncoder().encode(value));
+  const bytes = new Uint8Array(iv.length + data.byteLength);
+  bytes.set(iv); bytes.set(new Uint8Array(data), iv.length);
+  return btoa(String.fromCharCode(...bytes));
+}
+
+async function decrypt(value: string): Promise<string | null> {
+  try {
+    const bytes = Uint8Array.from(atob(value), (char) => char.charCodeAt(0));
+    const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: bytes.slice(0, 12) }, await getKey(), bytes.slice(12));
+    return new TextDecoder().decode(plain);
+  } catch { return null; }
+}
 
 function safeGet(key: string): string | null {
   if (memoryStore.has(key)) {
@@ -70,19 +93,22 @@ export function loadStreamNotes(): StreamNotesStore {
 }
 
 /** Get a note for a specific stream address. */
-export function getStreamNote(streamAddress: string): string | null {
+export async function getStreamNote(streamAddress: string): Promise<string | null> {
   const notes = loadStreamNotes();
-  return notes[streamAddress] || null;
+  const value = notes[streamAddress];
+  if (!value) return null;
+  return (await decrypt(value)) ?? value;
 }
 
 /** Save a note for a specific stream address. */
-export function saveStreamNote(streamAddress: string, note: string): void {
+export async function saveStreamNote(streamAddress: string, note: string): Promise<void> {
   const notes = loadStreamNotes();
   if (note.trim()) {
     notes[streamAddress] = note.trim();
   } else {
     delete notes[streamAddress];
   }
+  if (notes[streamAddress]) notes[streamAddress] = await encrypt(notes[streamAddress]);
   safeSet(STREAM_NOTES_STORAGE_KEY, JSON.stringify(notes));
 }
 
@@ -92,3 +118,4 @@ export function deleteStreamNote(streamAddress: string): void {
   delete notes[streamAddress];
   safeSet(STREAM_NOTES_STORAGE_KEY, JSON.stringify(notes));
 }
+

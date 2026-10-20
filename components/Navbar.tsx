@@ -3,11 +3,13 @@
 import { useEffect, useRef, useState } from 'react';
 import Link                 from 'next/link';
 import { usePathname }      from 'next/navigation';
-import { Menu, X }          from 'lucide-react';
+import { Menu, X, Bell }    from 'lucide-react';
 import { ConnectButton }    from '@/components/ConnectButton';
 import { ThemeToggle }      from '@/components/ThemeToggle';
 import { ErrorBoundary }    from '@/components/ErrorBoundary';
 import { NetworkBadge }     from '@/components/NetworkBadge';
+import { NotificationBell } from '@/components/NotificationBell';
+import { NetworkLatencyIndicator } from '@/components/NetworkLatencyIndicator';
 import { useSelectedNetwork } from '@/hooks/useSelectedNetwork';
 import { useSettings } from '@/hooks/useSettings';
 
@@ -96,8 +98,11 @@ export function Navbar() {
           conduit
         </Link>
 
-        {/* Active-network indicator — hidden on mainnet (#559) */}
-        <NetworkBadge network={network} />
+        {/* Active-network indicator & latency pill */}
+        <div className="flex items-center gap-2">
+          <NetworkBadge network={network} />
+          <NetworkLatencyIndicator />
+        </div>
 
         {/* Desktop nav links */}
         <nav className="hidden md:flex items-center gap-1">
@@ -124,6 +129,7 @@ export function Navbar() {
               </button>
             )}
           >
+            <NotificationBell />
             <ThemeToggle />
             <ConnectButton />
           </ErrorBoundary>

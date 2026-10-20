@@ -3,12 +3,12 @@
 import { Suspense, useEffect, useMemo, useState } from "react";
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import Link from "next/link";
-import { Plus, AlertCircle, Columns } from "lucide-react";
+import { Plus, AlertCircle, Columns, Pause, Wallet, X } from "lucide-react";
 import { useWallet } from "@/contexts/WalletContext";
 import { StreamCard } from "@/components/stream/StreamCard";
 import { StreamCardSkeleton } from "@/components/stream/StreamCardSkeleton";
 import { streamsBySender, streamsByRecipient } from "@/lib/factory";
-import { getStreamAddress, getStreamInfo, type StreamInfo } from '@/lib/stream';
+import { getStreamAddress, getStreamInfo, getWithdrawable, pause, cancel, withdraw, type StreamInfo } from '@/lib/stream';
 import { readSnapshot, saveSnapshot } from "@/lib/offline-cache";
 import { useNetworkStatus } from "@/hooks/useNetworkStatus";
 import { deriveStatus, MAX_COMPARE, MIN_COMPARE, type StreamStatus } from "@/lib/stream-compare";
@@ -20,6 +20,7 @@ type Tab = "receiving" | "sending";
 
 interface StreamRow {
   id: string;
+  address: string;
   info: StreamInfo;
   status: StreamStatus;
 }
@@ -52,6 +53,7 @@ async function loadRows(
       const info = await getStreamInfo(publicKey, addr);
       rows.push({
         id: id.toString(),
+        address: addr,
         info,
         status: deriveStatus(info, now),
       });
@@ -77,7 +79,7 @@ function statusFromParam(value: string | null): "ALL" | StreamStatus {
 }
 
 function StreamsView() {
-  const { publicKey, connected } = useWallet();
+  const { publicKey, connected, signTx } = useWallet();
   // The global NetworkTroubleBanner already covers RPC-down / fetch-failure
   // cases, so suppress this page's own error row when it's showing.
   const { status: networkStatus } = useNetworkStatus();
@@ -106,6 +108,8 @@ function StreamsView() {
   });
   // Stream ids ticked for the side-by-side /streams/compare view.
   const [selected, setSelected] = useState<string[]>([]);
+  const [batchPending, setBatchPending] = useState(false);
+  const [batchMessage, setBatchMessage] = useState<string | null>(null);
 
   useEffect(() => {
     const params = new URLSearchParams();
@@ -206,6 +210,25 @@ function StreamsView() {
     sort,
   );
 
+  const selectedRows = displayed.filter(row => selected.includes(row.id));
+  async function runBatch(action: 'pause' | 'withdraw' | 'cancel') {
+    if (!publicKey || !signTx || selectedRows.length === 0) return;
+    setBatchPending(true); setBatchMessage(null);
+    try {
+      for (const row of selectedRows) {
+        if (action === 'pause') await pause(publicKey, row.address, signTx);
+        else if (action === 'cancel') await cancel(publicKey, row.address, signTx);
+        else {
+          const amount = await getWithdrawable(publicKey, row.address);
+          if (amount > 0n) await withdraw(publicKey, row.address, amount, signTx);
+        }
+      }
+      setBatchMessage(`${action[0].toUpperCase() + action.slice(1)} completed for ${selectedRows.length} stream${selectedRows.length === 1 ? '' : 's'}.`);
+      setSelected([]);
+    } catch (error) { setBatchMessage(error instanceof Error ? error.message : 'Batch action failed'); }
+    finally { setBatchPending(false); }
+  }
+
   return (
     <div className="max-w-3xl mx-auto px-4 py-10">
       {/* Header */}
@@ -297,6 +320,9 @@ function StreamsView() {
                 : ""}
           </span>
           <div className="flex items-center gap-3">
+            {tab === 'sending' && <button disabled={batchPending} onClick={() => void runBatch('pause')} className="btn-secondary text-xs"><Pause className="w-3 h-3" /> Bulk Pause</button>}
+            {tab === 'receiving' && <button disabled={batchPending} onClick={() => void runBatch('withdraw')} className="btn-secondary text-xs"><Wallet className="w-3 h-3" /> Bulk Withdraw</button>}
+            {tab === 'sending' && <button disabled={batchPending} onClick={() => void runBatch('cancel')} className="btn-secondary text-xs"><X className="w-3 h-3" /> Bulk Cancel</button>}
             <button
               onClick={() => setSelected([])}
               className="text-xs underline text-gray-400 hover:text-black dark:hover:text-white"
@@ -318,6 +344,7 @@ function StreamsView() {
           </div>
         </div>
       )}
+      {batchMessage && <p role="status" className="text-sm text-gray-600 dark:text-gray-400 mb-4">{batchMessage}</p>}
 
       {/* Content */}
       {cachedAt && (

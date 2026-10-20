@@ -1,7 +1,20 @@
-import { useSyncExternalStore } from 'react';
+import { useEffect, useRef, useSyncExternalStore } from 'react';
 import type { NetworkConfig } from '@/lib/network-config';
 import { getDefaultNetwork } from '@/lib/network-config';
-import { loadSelectedNetwork, subscribeSelectedNetwork } from '@/lib/network-storage';
+import { loadSelectedNetwork, subscribeSelectedNetwork, saveSelectedNetwork } from '@/lib/network-storage';
+import { NETWORKS, isValidNetworkName } from '@/lib/network-config';
+
+function networkFromUrl() {
+  if (typeof window === 'undefined') return null;
+  const value = new URLSearchParams(window.location.search).get('network');
+  return value && isValidNetworkName(value) ? NETWORKS[value] : null;
+}
+
+function subscribeWithUrl(listener: () => void) {
+  const unsubscribe = subscribeSelectedNetwork(listener);
+  window.addEventListener('popstate', listener);
+  return () => { unsubscribe(); window.removeEventListener('popstate', listener); };
+}
 
 /**
  * Subscribe a component to the user's currently selected network (see
@@ -10,9 +23,19 @@ import { loadSelectedNetwork, subscribeSelectedNetwork } from '@/lib/network-sto
  * matching the pattern `useNetworkStatus` uses for RPC health.
  */
 export function useSelectedNetwork(): NetworkConfig {
-  return useSyncExternalStore(
-    subscribeSelectedNetwork,
-    loadSelectedNetwork,
-    getDefaultNetwork,
-  );
+  const network = useSyncExternalStore(subscribeWithUrl, () => networkFromUrl() ?? loadSelectedNetwork(), getDefaultNetwork);
+  const initialized = useRef(false);
+  useEffect(() => {
+    const selected = networkFromUrl();
+    if (selected) saveSelectedNetwork(selected.name);
+  }, []);
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (!initialized.current) { initialized.current = true; return; }
+    const url = new URL(window.location.href);
+    url.searchParams.set('network', network.name);
+    window.history.replaceState({}, '', url);
+  }, [network.name]);
+  return network;
 }
+

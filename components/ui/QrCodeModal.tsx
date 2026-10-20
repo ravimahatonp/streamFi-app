@@ -1,87 +1,92 @@
-"use client";
+'use client';
 
-import { useMemo } from "react";
-import qrcode from "qrcode-generator";
-import { Modal } from "@/components/ui/Modal";
+import { useEffect, useMemo, useRef, useState } from 'react';
+import QRCode from 'qrcode';
+import { Download } from 'lucide-react';
+import { Modal } from '@/components/ui/Modal';
+
+export type ErrorCorrectionLevel = 'L' | 'M' | 'Q' | 'H';
 
 interface QrCodeModalProps {
-  /** The address encoded into the QR code (legacy prop, kept for backwards compat). */
-  address?: string;
-  /**
-   * Generic payload encoded into the QR code (e.g. a stream claim URL).
-   * Takes precedence over `address` when both are provided (#688).
-   */
-  value?: string;
-  /** Modal title. Defaults to "Scan address" for address codes. */
+  isOpen: boolean;
+  value: string;
   title?: string;
   onClose: () => void;
+  errorCorrectionLevel?: ErrorCorrectionLevel;
 }
 
-/** Cell size in SVG user units — kept small since the <svg> itself scales via CSS. */
-const CELL_SIZE = 4;
+export function QrCodeModal({
+  isOpen,
+  value,
+  title = 'QR code',
+  onClose,
+  errorCorrectionLevel = 'H',
+}: QrCodeModalProps) {
+  const [qrDataUrl, setQrDataUrl] = useState('');
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
 
-/**
- * Renders a scannable QR code for a Stellar address in a modal (#550).
- *
- * Builds the code with `qrcode-generator` (zero dependencies, ~16 KB) and
- * draws it as plain inline SVG rects rather than using the library's
- * `createSvgTag` HTML-string output, so it needs no `dangerouslySetInnerHTML`
- * and can follow the app's light/dark theme.
- */
-export function QrCodeModal({ address, value, title, onClose }: QrCodeModalProps) {
-  // #688 — generic share payload (stream claim URL) with legacy address fallback.
-  const payload = value ?? address ?? "";
-  const modalTitle = title ?? "Scan address";
-  const modules = useMemo(() => {
-    // Type number 0 = auto-select the smallest size that fits the data.
-    const qr = qrcode(0, "M");
-    qr.addData(payload);
-    qr.make();
-    const count = qr.getModuleCount();
-    const cells: boolean[][] = [];
-    for (let row = 0; row < count; row++) {
-      const line: boolean[] = [];
-      for (let col = 0; col < count; col++) {
-        line.push(qr.isDark(row, col));
-      }
-      cells.push(line);
-    }
-    return cells;
-  }, [payload]);
+  const levelLabel = useMemo(() => errorCorrectionLevel, [errorCorrectionLevel]);
 
-  const size = modules.length * CELL_SIZE;
+  useEffect(() => {
+    if (!isOpen || !value) return;
+
+    QRCode.toCanvas(
+      canvasRef.current,
+      value,
+      {
+        errorCorrectionLevel,
+        margin: 1,
+        width: 240,
+        color: {
+          dark: '#111827',
+          light: '#ffffff',
+        },
+      },
+      (error) => {
+        if (error) {
+          console.error('QR code render failed', error);
+          return;
+        }
+
+        if (!canvasRef.current) return;
+
+        const dataUrl = canvasRef.current.toDataURL('image/png');
+        setQrDataUrl(dataUrl);
+      },
+    );
+  }, [isOpen, value, errorCorrectionLevel]);
+
+  if (!isOpen) return null;
+
+  const handleDownload = () => {
+    if (!qrDataUrl) return;
+    const link = document.createElement('a');
+    link.download = 'streamfi-qr.png';
+    link.href = qrDataUrl;
+    link.click();
+  };
 
   return (
-    <Modal title={modalTitle} onClose={onClose}>
-      <div className="flex flex-col items-center gap-4">
-        <div className="p-3 bg-white rounded">
-          <svg
-            viewBox={`0 0 ${size} ${size}`}
-            width={size * 4}
-            height={size * 4}
-            role="img"
-            aria-label={`QR code for ${payload}`}
-            className="block"
+    <Modal title={title} onClose={onClose} size="max-w-sm">
+      <div className="space-y-4">
+        <div className="flex items-center justify-between text-xs text-gray-500 dark:text-gray-400">
+          <span>Correction: {levelLabel}</span>
+          <button
+            type="button"
+            onClick={handleDownload}
+            className="inline-flex items-center gap-1 rounded border border-gray-200 bg-white px-2 py-1 text-xs font-medium text-gray-700 hover:bg-gray-50 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200 dark:hover:bg-gray-800"
           >
-            <rect x={0} y={0} width={size} height={size} fill="#fff" />
-            {modules.map((line, row) =>
-              line.map((dark, col) =>
-                dark ? (
-                  <rect
-                    key={`${row}-${col}`}
-                    x={col * CELL_SIZE}
-                    y={row * CELL_SIZE}
-                    width={CELL_SIZE}
-                    height={CELL_SIZE}
-                    fill="#000"
-                  />
-                ) : null,
-              ),
-            )}
-          </svg>
+            <Download className="h-3.5 w-3.5" />
+            Download PNG
+          </button>
         </div>
-        <p className="font-mono text-xs text-center break-all text-gray-500 dark:text-gray-400">
-          {payload}
+
+        <div className="flex justify-center rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-700 dark:bg-gray-900">
+          <canvas ref={canvasRef} className="h-56 w-56 rounded-lg bg-white" aria-label="QR code" />
+        </div>
+
+        <p className="break-all text-center text-[11px] text-gray-500 dark:text-gray-400">
+          {value}
         </p>
       </div>
     </Modal>
